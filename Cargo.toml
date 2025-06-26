@@ -3,4 +3,12 @@ name = "image_to_pixel_art_wasm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+image = "0.25.6"
+kmeans_colors = { version = "0.7.0", features = ["palette_color"] }
+palette = "0.7.6"
+wasm-bindgen = "0.2.100"
+getrandom = { version = "0.3", features = ["wasm_js"] }
