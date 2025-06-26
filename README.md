@@ -118,5 +118,41 @@ This project is released under the [MIT](LICENSE) license.
 
 ---
 
-*Authored entirely with **o3** in 30 minutes — see the git commit timestamps for proof.*
+## CLI Tool and Bulk Conversions
 
+If you prefer a native command-line workflow (and want to batch-process many files) you can build the optional `pixelate-cli` binary.
+
+Build it (native only – no WASM):
+```bash
+cargo build --release --features native-bin --bin pixelate-cli
+# binary at target/release/pixelate-cli
+```
+
+Usage overview:
+```bash
+pixelate-cli <INPUTS>... [options]
+
+OPTIONS
+  -k, --n-colors <N>    Number of colors for k-means (ignored when you supply a palette) [default: 8]
+  -s, --scale <S>       Down-sample size for the longest side            [default: 64]
+      --output-size <S> Final upscale size (longest side). Defaults to the original dimensions.
+  -c, --palette <HEX,…> Comma-separated list of 6-char hex colors to use instead of running k-means.
+  -d, --out-dir <DIR>   Directory to write results into (keeps original stems).
+  -p, --prefix <STR>    Prefix for output filenames when not using --out-dir  [default: pixelated_]
+```
+
+Examples
+```bash
+# Basic bulk conversion with default options
+target/release/pixelate-cli photos/*.jpg
+
+# Custom palette & write into `out/` directory
+target/release/pixelate-cli sprites/*.png \
+  --palette "FF0000,00FF00,0000FF" \
+  --scale 32 \
+  --out-dir out
+```
+
+---
+
+*Original WASM crate authored entirely with **o3** in 30 minutes — see the git commit timestamps for proof.*
