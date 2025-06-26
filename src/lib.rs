@@ -1,7 +1,8 @@
 use wasm_bindgen::prelude::*;
 use image::{self, DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
-use palette::{cast::from_component_slice, Lab, Srgb, IntoColor};
+use palette::{Lab, Srgb, IntoColor};
 use kmeans_colors::get_kmeans;
+use js_sys::{Uint8Array, Array, Object, Reflect};
 
 /// Convert an input image to low‐color pixel art.
 ///
@@ -19,7 +20,8 @@ pub fn pixelate(
     n_colors: usize,
     scale: u32,
     output_size: Option<u32>,
-) -> Result<Vec<u8>, JsValue> {
+    palette: Option<Array>,
+) -> Result<Object, JsValue> {
     // ----------------------
     // 1. Decode the image
     // ----------------------
@@ -27,44 +29,103 @@ pub fn pixelate(
         .map_err(|e| JsValue::from_str(&format!("Unable to decode image: {e}")))?;
     let (orig_w, orig_h) = img.dimensions();
 
-    // ----------------------
-    // 2. Build the color palette (k-means)
-    // ----------------------
-    // Extract RGB pixels as bytes
-    let rgb8 = img.to_rgb8();
-    let raw = rgb8.into_raw(); // length = w * h * 3
+    // Work with RGBA to preserve alpha channel
+    let rgba8 = img.to_rgba8();
+    let raw = rgba8.into_raw(); // length = w * h * 4
 
-    // Cast the &[u8] slice to a slice of sRGB pixels
-    let srgb_slice = from_component_slice::<Srgb<u8>>(&raw);
+    // Collect Lab pixels from non-transparent areas (alpha > 0) if we need to run k-means
+    let mut lab_pixels: Vec<Lab> = Vec::new();
+    let mut pixel_to_lab_idx: Vec<Option<usize>> = Vec::with_capacity((raw.len() / 4) as usize);
 
-    // Convert to Lab for perceptual k-means
-    let lab_pixels: Vec<Lab> = srgb_slice
-        .iter()
-        .map(|c| c.into_linear().into_color())
-        .collect();
-
-    // Run k-means (20 iterations max, small convergence threshold)
-    let kmeans = get_kmeans(n_colors, 20, 1e-4, false, &lab_pixels, 0);
-
-    // Convert centroids back to sRGB (8-bit)
-    let centroids: Vec<Srgb<u8>> = kmeans
-        .centroids
-        .iter()
-        .map(|&lab| {
-            let rgb_f32: Srgb<f32> = Srgb::from_linear(lab.into_color());
-            rgb_f32.into_format::<u8>()
-        })
-        .collect();
-
-    // Re-color every pixel using the centroid index map
-    let mut quantized_raw: Vec<u8> = Vec::with_capacity(raw.len());
-    for &idx in &kmeans.indices {
-        let c = centroids[idx as usize];
-        quantized_raw.extend_from_slice(&[c.red, c.green, c.blue]);
+    if palette.is_none() {
+        for chunk in raw.chunks(4) {
+            let r = chunk[0];
+            let g = chunk[1];
+            let b = chunk[2];
+            let a = chunk[3];
+            if a == 0 {
+                pixel_to_lab_idx.push(None);
+            } else {
+                let srgb = Srgb::<u8>::new(r, g, b);
+                lab_pixels.push(srgb.into_linear().into_color());
+                pixel_to_lab_idx.push(Some(lab_pixels.len() - 1));
+            }
+        }
+    } else {
+        // we still need mapping vector size
+        pixel_to_lab_idx.resize(raw.len() / 4, None);
     }
 
-    let quantized_img = DynamicImage::ImageRgb8(
-        image::ImageBuffer::from_raw(orig_w, orig_h, quantized_raw)
+    // Determine centroids (Vec<Srgb<u8>>)
+    let (centroids, kmeans_indices_opt): (Vec<Srgb<u8>>, Option<Vec<usize>>) = if let Some(js_palette) = palette.clone() {
+        let mut tmp = Vec::new();
+        for val in js_palette.iter() {
+            let s = val.as_string().ok_or_else(|| JsValue::from_str("Palette values must be strings"))?;
+            let hex = s.trim_start_matches('#');
+            if hex.len() != 6 {
+                return Err(JsValue::from_str("Hex color must be 6 characters"));
+            }
+            let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| JsValue::from_str("Invalid hex"))?;
+            let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| JsValue::from_str("Invalid hex"))?;
+            let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| JsValue::from_str("Invalid hex"))?;
+            tmp.push(Srgb::new(r, g, b));
+        }
+        (tmp, None)
+    } else {
+        let kmeans = get_kmeans(n_colors, 20, 1e-4, false, &lab_pixels, 0);
+        let centroids_vec: Vec<Srgb<u8>> = kmeans
+            .centroids
+            .iter()
+            .map(|&lab| {
+                let rgb_f32: Srgb<f32> = Srgb::from_linear(lab.into_color());
+                rgb_f32.into_format::<u8>()
+            })
+            .collect();
+        let indices_vec: Vec<usize> = kmeans.indices.iter().map(|x| *x as usize).collect();
+        (centroids_vec, Some(indices_vec))
+    };
+
+    // Map each non-transparent pixel to nearest centroid if palette provided, or use kmeans indices
+    let mut quantized_raw: Vec<u8> = Vec::with_capacity(raw.len());
+
+    for (i, chunk) in raw.chunks(4).enumerate() {
+        let a = chunk[3];
+        if a == 0 {
+            // keep fully transparent pixel as is
+            quantized_raw.extend_from_slice(chunk);
+        } else {
+            let centroid_color = if let Some(_js_palette) = &palette {
+                // need to compute nearest centroid in rgb space quickly (Euclidean)
+                let r = chunk[0] as i32;
+                let g = chunk[1] as i32;
+                let b = chunk[2] as i32;
+                let mut best_idx = 0;
+                let mut best_dist = i32::MAX;
+                for (idx, c) in centroids.iter().enumerate() {
+                    let dr = r - c.red as i32;
+                    let dg = g - c.green as i32;
+                    let db = b - c.blue as i32;
+                    let dist = dr*dr + dg*dg + db*db;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx = idx;
+                    }
+                }
+                centroids[best_idx]
+            } else {
+                // kmeans path
+                let idx_in_lab = pixel_to_lab_idx[i].unwrap();
+                let cluster_idx = kmeans_indices_opt.as_ref().unwrap()[idx_in_lab];
+                centroids[cluster_idx]
+            };
+
+            quantized_raw.extend_from_slice(&[centroid_color.red, centroid_color.green, centroid_color.blue, a]);
+        }
+    }
+
+    use image::RgbaImage;
+    let quantized_img = DynamicImage::ImageRgba8(
+        RgbaImage::from_raw(orig_w, orig_h, quantized_raw)
             .ok_or_else(|| JsValue::from_str("Failed to rebuild image buffer"))?,
     );
 
@@ -101,5 +162,24 @@ pub fn pixelate(
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(|e| JsValue::from_str(&format!("PNG encode error: {e}")))?;
 
-    return Ok(cursor.into_inner());
+    let encoded = cursor.into_inner();
+
+    // Build palette hex strings
+    let palette_hex: Vec<String> = centroids
+        .iter()
+        .map(|c| format!("{:02X}{:02X}{:02X}", c.red, c.green, c.blue))
+        .collect();
+
+    // Convert to JS types
+    let img_js = Uint8Array::from(encoded.as_slice());
+    let palette_js = Array::new();
+    for hex in palette_hex {
+        palette_js.push(&JsValue::from_str(&hex));
+    }
+
+    let result = Object::new();
+    Reflect::set(&result, &JsValue::from_str("image"), &img_js)?;
+    Reflect::set(&result, &JsValue::from_str("palette"), &palette_js)?;
+
+    Ok(result)
 }

@@ -3,6 +3,8 @@
 Try the pixel-art converter instantly at **https://gametorch.app/image-to-pixel-art**  
 *Free forever · no sign-up required · runs 100 % in your browser*
 
+![Spirit Moose](spirit_moose.png)
+
 ---
 
 # image_to_pixel_art_wasm
@@ -10,15 +12,24 @@ Try the pixel-art converter instantly at **https://gametorch.app/image-to-pixel-
 A tiny Rust → WebAssembly library that turns any raster image into low-color *pixel-art*.
 
 Features
-- K-means palette extraction with user-selectable color count.
-- Down-samples to a fixed tile grid (e.g. 64 × 64) using nearest-neighbour and then scales it back up – aspect-ratio preserved at every step.
+- K-means palette extraction with user-selectable color count **or** supply your own palette.
+- Keeps transparency intact – only opaque pixels are processed.
+- Down-samples to a fixed tile grid (e.g. 64 × 64) using nearest-neighbour then scales back up – aspect-ratio preserved.
 - Pure client-side: the heavy lifting happens completely inside your browser thanks to WASM.
 
-The single public API is exported via `wasm-bindgen`:
+The public API exported via `wasm-bindgen`:
 ```ts
-pixelate(input: Uint8Array, n_colors: number, scale: number, output_size?: number): Uint8Array
+// palette is optional: string[ ] of 6-char HEX, e.g. ["FFAA00", "112233"]
+// returns { image: Uint8Array, palette: string[ ] }
+function pixelate(
+  input: Uint8Array,
+  n_colors: number,
+  scale: number,
+  output_size?: number,
+  palette?: string[]
+): { image: Uint8Array; palette: string[] };
 ```
-It returns PNG-encoded bytes that you can turn into a `Blob`, `ObjectURL`, `ImageBitmap`, …
+It returns PNG-encoded bytes plus the palette actually used (either supplied or discovered).
 
 ---
 
