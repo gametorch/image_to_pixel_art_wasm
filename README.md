@@ -104,3 +104,8 @@ By declaring both we keep the crate usable as a normal Rust dependency *and* rea
 ## License
 
 This project is released under the [MIT](LICENSE) license. 
+
+---
+
+*Authored entirely with **o3** in 30 minutes — see the git commit timestamps for proof.*
+
