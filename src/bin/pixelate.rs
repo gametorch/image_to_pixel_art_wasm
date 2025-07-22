@@ -1,9 +1,8 @@
 use clap::Parser;
 use std::fs;
 use std::path::{PathBuf};
-use image_to_pixel_art_wasm::pixelate_bytes; // we need to implement
-use anyhow::Context;
-use anyhow::Result;
+use image_to_pixel_art_wasm::{pixelate_bytes, extract_palette_bytes};
+use anyhow::{Context, Result, bail};
 
 /// Pixel-artify images using the Rust WASM library (native wrapper).
 #[derive(Parser, Debug)]
@@ -29,6 +28,14 @@ struct Args {
     #[arg(short = 'c', long)]
     palette: Option<String>,
 
+    /// Extract k-means palette from this reference image, then apply to inputs
+    #[arg(long, value_name = "FILE")]
+    fix_palette: Option<PathBuf>,
+
+    /// Skip downscale before palette extraction
+    #[arg(long, default_value_t = false)]
+    no_downscale: bool,
+
     /// Output directory
     #[arg(short = 'd', long)]
     out_dir: Option<PathBuf>,
@@ -36,18 +43,31 @@ struct Args {
     /// Output filename prefix (ignored when --out-dir supplied)
     #[arg(short = 'p', long, default_value = "pixelated_")]
     prefix: String,
+
+    /// Machine-readable output (JSON)
+    #[arg(long)]
+    porcelain: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let palette_vec: Option<Vec<String>> = args.palette.as_ref().map(|s| {
-        s.split(',').map(|x| x.trim().trim_start_matches('#').to_uppercase()).collect()
-    });
+    if args.palette.is_some() && args.fix_palette.is_some() {
+        bail!("--palette and --fix-palette cannot be used together");
+    }
+
+    let palette_vec: Option<Vec<String>> = if let Some(ref ref_img) = args.fix_palette {
+        let bytes = fs::read(ref_img).with_context(|| format!("Failed to read reference image {}", ref_img.display()))?;
+        Some(extract_palette_bytes(&bytes, args.n_colors, if args.no_downscale { None } else { Some(args.scale) }).context("Extracting palette with k-means failed")?)
+    } else if let Some(ref s) = args.palette {
+        Some(s.split(',').map(|x| x.trim().trim_start_matches('#').to_uppercase()).collect())
+    } else {
+        None
+    };
 
     for input in &args.inputs {
         let bytes = fs::read(input)?;
-        let (png, _pal) = pixelate_bytes(
+        let (png, pal) = pixelate_bytes(
             &bytes,
             args.n_colors,
             args.scale,
@@ -67,7 +87,39 @@ fn main() -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         fs::write(&out_path, png)?;
-        println!("Saved → {}", out_path.display());
+
+        if args.porcelain {
+            use serde_json::json;
+
+            let abs_path = out_path.canonicalize().unwrap_or(out_path.clone());
+
+            let args_json = json!({
+                "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "n_colors": args.n_colors,
+                "scale": args.scale,
+                "output_size": args.output_size,
+                "palette": palette_vec,
+                "fix_palette": args.fix_palette.as_ref().map(|p| p.to_string_lossy()),
+                "no_downscale": args.no_downscale,
+                "out_dir": args.out_dir.as_ref().map(|p| p.to_string_lossy()),
+                "prefix": args.prefix,
+            });
+
+            let output_json = json!({
+                "is_directory": args.out_dir.is_some(),
+                "path": abs_path.to_string_lossy(),
+                "palette": pal,
+            });
+
+            let report = json!({
+                "input_args": args_json,
+                "output": output_json,
+            });
+
+            println!("{}", report.to_string());
+        } else {
+            println!("Saved → {}", out_path.display());
+        }
     }
 
     Ok(())

@@ -297,3 +297,47 @@ pub fn pixelate_bytes(
 
     Ok((buf, palette_hex_out))
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn extract_palette_bytes(
+    input: &[u8],
+    n_colors: usize,
+    downscale: Option<u32>,
+) -> Result<Vec<String>> {
+    // Decode the image
+    let img = image::load_from_memory(input)?;
+
+    // Optionally downscale for faster k-means
+    let working_img: DynamicImage = if let Some(scale) = downscale {
+        let (orig_w, orig_h) = img.dimensions();
+        let max_side = orig_w.max(orig_h) as f32;
+        let ratio = scale as f32 / max_side;
+        let w = ((orig_w as f32) * ratio).round().max(1.0) as u32;
+        let h = ((orig_h as f32) * ratio).round().max(1.0) as u32;
+        image::DynamicImage::ImageRgba8(image::imageops::resize(&img, w, h, FilterType::Nearest))
+    } else {
+        img
+    };
+
+    let raw = working_img.to_rgba8().into_raw();
+
+    // Collect Lab pixels from opaque areas
+    let mut lab_pixels: Vec<Lab> = Vec::new();
+    for chunk in raw.chunks(4) {
+        if chunk[3] == 0 { continue; }
+        let srgb = Srgb::<u8>::new(chunk[0], chunk[1], chunk[2]);
+        lab_pixels.push(srgb.into_linear().into_color());
+    }
+
+    // Run k-means
+    let kmeans = get_kmeans(n_colors, 20, 1e-4, false, &lab_pixels, 0);
+
+    // Convert centroids to HEX strings
+    let palette_hex: Vec<String> = kmeans.centroids.iter().map(|&lab| {
+        let rgb_f32: Srgb<f32> = Srgb::from_linear(lab.into_color());
+        let c: Srgb<u8> = rgb_f32.into_format::<u8>();
+        format!("{:02X}{:02X}{:02X}", c.red, c.green, c.blue)
+    }).collect();
+
+    Ok(palette_hex)
+}

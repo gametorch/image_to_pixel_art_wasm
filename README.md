@@ -128,26 +128,44 @@ cargo build --release --features native-bin --bin pixelate-cli
 # binary at target/release/pixelate-cli
 ```
 
+Or install it for system-wide use, assuming ~/.cargo/bin is in your PATH environment variable):
+```bash
+cargo install --path . --features native-bin --bin pixelate-cli
+```
+
 Usage overview:
 ```bash
-pixelate-cli <INPUTS>... [options]
+Pixel-artify images using the Rust WASM library (native wrapper)
 
-OPTIONS
-  -k, --n-colors <N>    Number of colors for k-means (ignored when you supply a palette) [default: 8]
-  -s, --scale <S>       Down-sample size for the longest side            [default: 64]
-      --output-size <S> Final upscale size (longest side). Defaults to the original dimensions.
-  -c, --palette <HEX,…> Comma-separated list of 6-char hex colors to use instead of running k-means.
-  -d, --out-dir <DIR>   Directory to write results into (keeps original stems).
-  -p, --prefix <STR>    Prefix for output filenames when not using --out-dir  [default: pixelated_]
+Usage: pixelate-cli [OPTIONS] <INPUTS>...
+
+Arguments:
+  <INPUTS>...  One or more input image paths
+
+Options:
+  -k, --n-colors <N_COLORS>        Number of colors for k-means when no custom palette is provided [default: 8]
+  -s, --scale <SCALE>              Target down-sample size (longest side) [default: 64]
+  -o, --output-size <OUTPUT_SIZE>  Optional upscale size. If omitted, original dimensions are used
+  -c, --palette <PALETTE>          Comma-separated list of hex colors to use as palette (skip k-means)
+      --fix-palette <FILE>         Extract k-means palette from this reference image, then apply to inputs
+      --no-downscale               Skip downscale before palette extraction
+  -d, --out-dir <OUT_DIR>          Output directory
+  -p, --prefix <PREFIX>            Output filename prefix (ignored when --out-dir supplied) [default: pixelated_]
+      --porcelain                  Machine-readable output (JSON)
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 Examples
 ```bash
 # Basic bulk conversion with default options
-target/release/pixelate-cli photos/*.jpg
+pixelate-cli photos/*.jpg
+
+# Basic bulk conversion with ONE color palette used for all images
+pixelate-cli photos/*.jpg --fix-palette photos/my_reference_image.jpg
 
 # Custom palette & write into `out/` directory
-target/release/pixelate-cli sprites/*.png \
+pixelate-cli sprites/*.png \
   --palette "FF0000,00FF00,0000FF" \
   --scale 32 \
   --out-dir out
