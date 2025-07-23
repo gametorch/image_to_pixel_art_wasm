@@ -158,7 +158,13 @@ Options:
 
 Examples
 ```bash
-# Basic bulk conversion with default options
+# Basic conversion
+pixelate-cli moose.jpg --n-colors 64
+
+# Make the resulting "pixels" smaller (there will be more "pixels")
+pixelate-cli moose.jpg --n-colors 64 --relative-scale 0.25
+
+# Basic bulk conversion
 pixelate-cli photos/*.jpg
 
 # Basic bulk conversion with ONE color palette used for all images

@@ -14,16 +14,12 @@ struct Args {
     inputs: Vec<PathBuf>,
 
     /// Number of colors for k-means when no custom palette is provided
-    #[arg(short = 'k', long, default_value_t = 8)]
+    #[arg(short = 'k', long, default_value_t = 16)]
     n_colors: usize,
 
-    /// Target down-sample size (longest side)
-    #[arg(short, long, default_value_t = 64, conflicts_with = "relative_scale")]
-    scale: u32,
-
     /// Scaling factor for resulting "pixel" size. (0.0, ∞). Applied per-image.
-    #[arg(long, value_name = "FLOAT", conflicts_with = "scale")]
-    relative_scale: Option<f32>,
+    #[arg(long, default_value_t = 1.0)]
+    relative_scale: f32,
 
     /// Optional upscale size. If omitted, original dimensions are used.
     #[arg(short, long)]
@@ -57,11 +53,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Validate relative_scale range if provided
-    if let Some(rel) = args.relative_scale {
-        if !(rel > 0.0) {
-            bail!("--relative-scale must be within (0.0, ∞)");
-        }
+    // Validate relative_scale range
+    if args.relative_scale <= 0.0 {
+        bail!("--relative-scale must be within (0.0, ∞)");
     }
 
     if args.palette.is_some() && args.fix_palette.is_some() {
@@ -74,14 +68,13 @@ fn main() -> Result<()> {
         // Determine downscale size for reference palette extraction
         let downscale_opt = if args.no_downscale {
             None
-        } else if let Some(rel) = args.relative_scale {
+        } else {
+            let rel = args.relative_scale;
             let img = image::load_from_memory(&bytes)
                 .with_context(|| format!("Decoding reference image {} failed", ref_img.display()))?;
             let (w, h) = img.dimensions();
             let longest = w.max(h) as f32;
             Some(((longest * (2.0 / (longest * rel * 0.5).sqrt())).round().max(1.0)) as u32)
-        } else {
-            Some(args.scale)
         };
 
         Some(extract_palette_bytes(&bytes, args.n_colors, downscale_opt).context("Extracting palette with k-means failed")?)
@@ -94,15 +87,13 @@ fn main() -> Result<()> {
     for input in &args.inputs {
         let bytes = fs::read(input)?;
 
-        // Determine scale in pixels depending on --relative-scale or --scale
-        let scale_px: u32 = if let Some(rel) = args.relative_scale {
-            let img = image::load_from_memory(&bytes).with_context(|| format!("Decoding image {} for relative-scale computation failed", input.display()))?;
-            let (w, h) = img.dimensions();
-            let longest = w.max(h) as f32;
-            ((longest * (2.0 / (longest * rel * 0.5).sqrt())).round().max(1.0)) as u32
-        } else {
-            args.scale
-        };
+        // Determine scale in pixels based on --relative-scale
+        let rel = args.relative_scale;
+        let img = image::load_from_memory(&bytes)
+            .with_context(|| format!("Decoding image {} for relative-scale computation failed", input.display()))?;
+        let (w, h) = img.dimensions();
+        let longest = w.max(h) as f32;
+        let scale_px: u32 = ((longest * (2.0 / (longest * rel * 0.5).sqrt())).round().max(1.0)) as u32;
 
         let (png, pal) = pixelate_bytes(
             &bytes,
