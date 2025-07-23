@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{PathBuf};
 use image_to_pixel_art_wasm::{pixelate_bytes, extract_palette_bytes};
 use anyhow::{Context, Result, bail};
+use image::{self, GenericImageView};
 
 /// Pixel-artify images using the Rust WASM library (native wrapper).
 #[derive(Parser, Debug)]
@@ -17,8 +18,12 @@ struct Args {
     n_colors: usize,
 
     /// Target down-sample size (longest side)
-    #[arg(short, long, default_value_t = 64)]
+    #[arg(short, long, default_value_t = 64, conflicts_with = "relative_scale")]
     scale: u32,
+
+    /// Relative down-sample factor in (0,1]. Overrides --scale. Applied per-image.
+    #[arg(long, value_name = "FLOAT", conflicts_with = "scale")]
+    relative_scale: Option<f32>,
 
     /// Optional upscale size. If omitted, original dimensions are used.
     #[arg(short, long)]
@@ -52,13 +57,34 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Validate relative_scale range if provided
+    if let Some(rel) = args.relative_scale {
+        if !(rel > 0.0) {
+            bail!("--relative-scale must be within (0.0, ∞)");
+        }
+    }
+
     if args.palette.is_some() && args.fix_palette.is_some() {
         bail!("--palette and --fix-palette cannot be used together");
     }
 
     let palette_vec: Option<Vec<String>> = if let Some(ref ref_img) = args.fix_palette {
         let bytes = fs::read(ref_img).with_context(|| format!("Failed to read reference image {}", ref_img.display()))?;
-        Some(extract_palette_bytes(&bytes, args.n_colors, if args.no_downscale { None } else { Some(args.scale) }).context("Extracting palette with k-means failed")?)
+
+        // Determine downscale size for reference palette extraction
+        let downscale_opt = if args.no_downscale {
+            None
+        } else if let Some(rel) = args.relative_scale {
+            let img = image::load_from_memory(&bytes)
+                .with_context(|| format!("Decoding reference image {} failed", ref_img.display()))?;
+            let (w, h) = img.dimensions();
+            let longest = w.max(h) as f32;
+            Some(((longest * (2.0 / (longest * rel * 0.5).sqrt())).round().max(1.0)) as u32)
+        } else {
+            Some(args.scale)
+        };
+
+        Some(extract_palette_bytes(&bytes, args.n_colors, downscale_opt).context("Extracting palette with k-means failed")?)
     } else if let Some(ref s) = args.palette {
         Some(s.split(',').map(|x| x.trim().trim_start_matches('#').to_uppercase()).collect())
     } else {
@@ -67,10 +93,21 @@ fn main() -> Result<()> {
 
     for input in &args.inputs {
         let bytes = fs::read(input)?;
+
+        // Determine scale in pixels depending on --relative-scale or --scale
+        let scale_px: u32 = if let Some(rel) = args.relative_scale {
+            let img = image::load_from_memory(&bytes).with_context(|| format!("Decoding image {} for relative-scale computation failed", input.display()))?;
+            let (w, h) = img.dimensions();
+            let longest = w.max(h) as f32;
+            ((longest * (2.0 / (longest * rel * 0.5).sqrt())).round().max(1.0)) as u32
+        } else {
+            args.scale
+        };
+
         let (png, pal) = pixelate_bytes(
             &bytes,
             args.n_colors,
-            args.scale,
+            scale_px,
             args.output_size,
             palette_vec.as_deref(),
         ).context("pixelate processing failed")?;
@@ -96,7 +133,8 @@ fn main() -> Result<()> {
             let args_json = json!({
                 "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
                 "n_colors": args.n_colors,
-                "scale": args.scale,
+                "scale": scale_px,
+                "relative_scale": args.relative_scale,
                 "output_size": args.output_size,
                 "palette": palette_vec,
                 "fix_palette": args.fix_palette.as_ref().map(|p| p.to_string_lossy()),

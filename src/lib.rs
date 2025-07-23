@@ -7,6 +7,155 @@ use image::RgbaImage;
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Result, anyhow, bail};
 
+const LUMINANCE_WEIGHT: f32 = 0.0;
+
+// ------------------------------------------------------------
+// Luminance‐based downscaling helpers
+// ------------------------------------------------------------
+
+/// Strategy used when selecting a representative pixel from a sampling block
+/// based on its luminance.
+#[derive(Clone, Copy, Debug)]
+enum LuminanceStrategy {
+    /// Choose the pixel with the **lowest** luminance.
+    Darkest,
+    /// Choose the pixel with the **highest** luminance.
+    Lightest,
+    /// Choose the pixel whose luminance is **farthest** from mid-luminance (≈0.5).
+    /// In other words, pick the pixel that is closest to *either* black **or** white.
+    MostExtreme,
+    /// Choose the pixel whose luminance is **closest** to mid-luminance (≈0.5).
+    LeastExtreme,
+}
+
+/// Utility that decides whether the `candidate` metric is "better" than the
+/// current `best` metric for the given `strategy`.
+#[inline(always)]
+fn is_better(strategy: LuminanceStrategy, candidate: f32, best: f32) -> bool {
+    match strategy {
+        LuminanceStrategy::Darkest | LuminanceStrategy::LeastExtreme => candidate < best,
+        LuminanceStrategy::Lightest | LuminanceStrategy::MostExtreme => candidate > best,
+    }
+}
+
+// ------------------------------------------------------------
+// Generic luminance-aware downscaling (supports multiple strategies)
+// ------------------------------------------------------------
+
+/// Down-scale an image by selecting a representative pixel from every sampling
+/// block according to the provided `strategy`.
+///
+/// The implementation mirrors the original two-pass SIMD-friendly approach
+/// (vertical then horizontal) while allowing different selection criteria.
+fn downscale_with_luminance(
+    img: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    strategy: LuminanceStrategy,
+) -> DynamicImage {
+    let (in_w, in_h) = img.dimensions();
+
+    // Fast path – no scaling required.
+    if out_w == in_w && out_h == in_h {
+        return img.clone();
+    }
+
+    // Raw RGBA bytes.
+    let raw = img.to_rgba8().into_raw();
+
+    // --------------------------------------------------------
+    // First pass: vertical reduction (m×1)
+    // --------------------------------------------------------
+    let mut vertical: Vec<[u8; 4]> = vec![[0u8; 4]; (in_w * out_h) as usize];
+    let scale_y = in_h as f32 / out_h as f32;
+
+    let mid_lum = 127.5_f32; // Approximate mid-luminance in 0-255 space.
+
+    for x in 0..in_w {
+        for y_out in 0..out_h {
+            let y_start = (y_out as f32 * scale_y).floor() as u32;
+            let y_end = (((y_out as f32 + 1.0) * scale_y).ceil() as u32).min(in_h);
+
+            let mut best_metric = match strategy {
+                LuminanceStrategy::Darkest | LuminanceStrategy::LeastExtreme => f32::INFINITY,
+                LuminanceStrategy::Lightest | LuminanceStrategy::MostExtreme => f32::NEG_INFINITY,
+            };
+            let mut chosen = [0u8; 4];
+
+            for y in y_start..y_end {
+                let idx = ((y * in_w + x) * 4) as usize;
+                let r = raw[idx] as f32;
+                let g = raw[idx + 1] as f32;
+                let b = raw[idx + 2] as f32;
+                let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                let metric = match strategy {
+                    LuminanceStrategy::Darkest | LuminanceStrategy::Lightest => lum,
+                    LuminanceStrategy::MostExtreme | LuminanceStrategy::LeastExtreme => (lum - mid_lum).abs(),
+                };
+
+                if is_better(strategy, metric, best_metric) {
+                    best_metric = metric;
+                    chosen = [raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]];
+                }
+            }
+
+            vertical[(y_out * in_w + x) as usize] = chosen;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Second pass: horizontal reduction (1×m)
+    // --------------------------------------------------------
+    let mut out_buf: Vec<u8> = vec![0u8; (out_w * out_h * 4) as usize];
+    let scale_x = in_w as f32 / out_w as f32;
+
+    for y_out in 0..out_h {
+        for x_out in 0..out_w {
+            let x_start = (x_out as f32 * scale_x).floor() as u32;
+            let x_end = (((x_out as f32 + 1.0) * scale_x).ceil() as u32).min(in_w);
+
+            let mut best_metric = match strategy {
+                LuminanceStrategy::Darkest | LuminanceStrategy::LeastExtreme => f32::INFINITY,
+                LuminanceStrategy::Lightest | LuminanceStrategy::MostExtreme => f32::NEG_INFINITY,
+            };
+            let mut chosen = [0u8; 4];
+
+            for x in x_start..x_end {
+                let pix = vertical[(y_out * in_w + x) as usize];
+                let r = pix[0] as f32;
+                let g = pix[1] as f32;
+                let b = pix[2] as f32;
+                let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                let metric = match strategy {
+                    LuminanceStrategy::Darkest | LuminanceStrategy::Lightest => lum,
+                    LuminanceStrategy::MostExtreme | LuminanceStrategy::LeastExtreme => (lum - mid_lum).abs(),
+                };
+
+                if is_better(strategy, metric, best_metric) {
+                    best_metric = metric;
+                    chosen = pix;
+                }
+            }
+
+            let idx = ((y_out * out_w + x_out) * 4) as usize;
+            out_buf[idx..idx + 4].copy_from_slice(&chosen);
+        }
+    }
+
+    DynamicImage::ImageRgba8(
+        RgbaImage::from_raw(out_w, out_h, out_buf)
+            .expect("Failed to build output image in downscale_with_luminance"),
+    )
+}
+
+// Darkest-pixel downscaling (min-luminance)
+// ------------------------------------------------------------
+// NOTE: The old `downscale_darkest` function has been replaced by the
+// generic `downscale_with_luminance`. For backwards compatibility (internal
+// to this crate) we could keep a thin wrapper, but we opt to migrate the call
+// sites instead.
 /// Convert an input image to low‐color pixel art.
 ///
 /// Steps performed:
@@ -139,7 +288,9 @@ pub fn pixelate(
     let down_w = ((orig_w as f32) * ratio_down).round().max(1.0) as u32;
     let down_h = ((orig_h as f32) * ratio_down).round().max(1.0) as u32;
 
-    let downscaled = image::imageops::resize(&quantized_img, down_w, down_h, FilterType::Nearest);
+    // let downscaled = image::imageops::resize(&quantized_img, down_w, down_h, FilterType::Nearest);
+    // let downscaled = downscale_with_luminance(&quantized_img, down_w, down_h, LuminanceStrategy::Darkest);
+    let downscaled = downscale_with_histogram(&quantized_img, down_w, down_h, n_colors, LUMINANCE_WEIGHT);
 
     // ----------------------
     // 4. Up-scale
@@ -187,6 +338,170 @@ pub fn pixelate(
     Reflect::set(&result, &JsValue::from_str("palette"), &palette_js)?;
 
     Ok(result)
+}
+
+// ------------------------------------------------------------
+// Histogram-based downscaling (mode color with darkest-pixel tie-break)
+// ------------------------------------------------------------
+fn downscale_with_histogram(
+    img: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    n_colors: usize,
+    weight_c: f32,
+) -> DynamicImage {
+    let (in_w, in_h) = img.dimensions();
+
+    // Fast path – no scaling required.
+    if out_w == in_w && out_h == in_h {
+        return img.clone();
+    }
+
+    // Raw RGBA bytes.
+    let raw = img.to_rgba8().into_raw();
+
+    // --------------------------------------------------------
+    // First pass: vertical reduction (m×1)
+    // --------------------------------------------------------
+    let mut vertical: Vec<[u8; 4]> = vec![[0u8; 4]; (in_w * out_h) as usize];
+    let scale_y = in_h as f32 / out_h as f32;
+
+    // A small, stack-allocated histogram ‑ we never use more than `n_colors ≤ 64`.
+    const MAX_COLORS: usize = 64;
+
+    for x in 0..in_w {
+        for y_out in 0..out_h {
+            let y_start = (y_out as f32 * scale_y).floor() as u32;
+            let y_end = (((y_out as f32 + 1.0) * scale_y).ceil() as u32).min(in_h);
+
+            let mut colors: [[u8; 4]; MAX_COLORS] = [[0; 4]; MAX_COLORS];
+            let mut counts: [u32; MAX_COLORS] = [0; MAX_COLORS];
+            let mut used = 0usize;
+
+            for y in y_start..y_end {
+                let idx = ((y * in_w + x) * 4) as usize;
+                let pix = [raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]];
+
+                // Linear search – fine for ≤64 entries.
+                let mut found = None;
+                for i in 0..used {
+                    if colors[i] == pix {
+                        found = Some(i);
+                        break;
+                    }
+                }
+
+                match found {
+                    Some(i) => counts[i] += 1,
+                    None => {
+                        if used < n_colors && used < MAX_COLORS {
+                            colors[used] = pix;
+                            counts[used] = 1;
+                            used += 1;
+                        }
+                    }
+                }
+            }
+
+            // Choose the colour with the highest weighted frequency; if equal, prefer the darkest.
+            let mut best_idx = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_lum = f32::INFINITY; // smaller = darker
+
+            for i in 0..used {
+                let lum = 0.2126 * colors[i][0] as f32
+                    + 0.7152 * colors[i][1] as f32
+                    + 0.0722 * colors[i][2] as f32;
+                let norm_lum = lum / 255.0; // 0-1
+                let score = (counts[i] as f32) * (1.0 + weight_c * (1.0 - norm_lum));
+
+                if score > best_score {
+                    best_score = score;
+                    best_idx = i;
+                    best_lum = lum;
+                } else if (score - best_score).abs() < 1e-6 {
+                    // tie – pick the darker colour
+                    if lum < best_lum {
+                        best_idx = i;
+                        best_lum = lum;
+                    }
+                }
+            }
+
+            vertical[(y_out * in_w + x) as usize] = colors[best_idx];
+        }
+    }
+
+    // --------------------------------------------------------
+    // Second pass: horizontal reduction (1×m)
+    // --------------------------------------------------------
+    let mut out_buf: Vec<u8> = vec![0u8; (out_w * out_h * 4) as usize];
+    let scale_x = in_w as f32 / out_w as f32;
+
+    for y_out in 0..out_h {
+        for x_out in 0..out_w {
+            let x_start = (x_out as f32 * scale_x).floor() as u32;
+            let x_end = (((x_out as f32 + 1.0) * scale_x).ceil() as u32).min(in_w);
+
+            let mut colors: [[u8; 4]; MAX_COLORS] = [[0; 4]; MAX_COLORS];
+            let mut counts: [u32; MAX_COLORS] = [0; MAX_COLORS];
+            let mut used = 0usize;
+
+            for x in x_start..x_end {
+                let pix = vertical[(y_out * in_w + x) as usize];
+
+                let mut found = None;
+                for i in 0..used {
+                    if colors[i] == pix {
+                        found = Some(i);
+                        break;
+                    }
+                }
+
+                match found {
+                    Some(i) => counts[i] += 1,
+                    None => {
+                        if used < n_colors && used < MAX_COLORS {
+                            colors[used] = pix;
+                            counts[used] = 1;
+                            used += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut best_idx = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_lum = f32::INFINITY;
+
+            for i in 0..used {
+                let lum = 0.2126 * colors[i][0] as f32
+                    + 0.7152 * colors[i][1] as f32
+                    + 0.0722 * colors[i][2] as f32;
+                let norm_lum = lum / 255.0;
+                let score = (counts[i] as f32) * (1.0 + weight_c * (1.0 - norm_lum));
+
+                if score > best_score {
+                    best_score = score;
+                    best_idx = i;
+                    best_lum = lum;
+                } else if (score - best_score).abs() < 1e-6 {
+                    if lum < best_lum {
+                        best_idx = i;
+                        best_lum = lum;
+                    }
+                }
+            }
+
+            let idx = ((y_out * out_w + x_out) * 4) as usize;
+            out_buf[idx..idx + 4].copy_from_slice(&colors[best_idx]);
+        }
+    }
+
+    DynamicImage::ImageRgba8(
+        RgbaImage::from_raw(out_w, out_h, out_buf)
+            .expect("Failed to build output image in downscale_with_histogram"),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -282,7 +597,9 @@ pub fn pixelate_bytes(
     let ratio_down = scale as f32 / max_side;
     let down_w = ((orig_w as f32)*ratio_down).round().max(1.0) as u32;
     let down_h = ((orig_h as f32)*ratio_down).round().max(1.0) as u32;
-    let downscaled = image::imageops::resize(&quantized_img, down_w, down_h, FilterType::Nearest);
+    // let downscaled = image::imageops::resize(&quantized_img, down_w, down_h, FilterType::Nearest);
+    // let downscaled = downscale_with_luminance(&quantized_img, down_w, down_h, LuminanceStrategy::Darkest);
+    let downscaled = downscale_with_histogram(&quantized_img, down_w, down_h, n_colors, LUMINANCE_WEIGHT);
 
     let (final_w, final_h) = if let Some(sz) = output_size { let r= sz as f32 / max_side; (((orig_w as f32)*r).round() as u32, ((orig_h as f32)*r).round() as u32) } else { (orig_w, orig_h) };
     let upscaled = image::imageops::resize(&downscaled, final_w, final_h, FilterType::Nearest);
